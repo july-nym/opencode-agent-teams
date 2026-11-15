@@ -53,11 +53,12 @@ export default Plugin.define({
     }
 
     // 1. Register Swarm Tools (team_delegate, team_status, team_broadcast, team_terminate)
+    // 16 Nov 2026 local patch: OpenCode 2.3.0 hides plugin tools in code mode unless codemode is false.
     ctx.tool.transform((editor: any) => {
-      editor.add(createDelegateTool(ctx))
-      editor.add(createStatusTool(ctx))
-      editor.add(createBroadcastTool(ctx))
-      editor.add(createTerminateTool(ctx))
+      editor.add({ ...createDelegateTool(ctx), options: { codemode: false } })
+      editor.add({ ...createStatusTool(ctx), options: { codemode: false } })
+      editor.add({ ...createBroadcastTool(ctx), options: { codemode: false } })
+      editor.add({ ...createTerminateTool(ctx), options: { codemode: false } })
     })
 
     // 2. Register Clean, Non-Conflicting Slash Commands

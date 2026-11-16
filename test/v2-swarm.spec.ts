@@ -5,6 +5,7 @@ import { execFile } from "node:child_process"
 import { promisify } from "node:util"
 import { globalTracker } from "../src/state/tracker.js"
 import { WorktreeManager } from "../src/worktree/manager.js"
+import { createDelegateTool } from "../src/tools/delegate.js"
 import { createStatusTool } from "../src/tools/status.js"
 import { createBroadcastTool } from "../src/tools/broadcast.js"
 import { createTerminateTool } from "../src/tools/terminate.js"
@@ -77,6 +78,61 @@ async function runTests() {
   )
   assert.ok(termRes.content.includes("Terminated and cleaned up 2"), "Should terminate all 2 running workers")
   console.log("✓ team_terminate execution verified")
+
+  // Test 3: team_delegate returns the child's reply and never fakes success
+  console.log("\n[Test 3] Testing team_delegate reply capture...")
+  const fakeCtx = (messages: any[], wait: () => Promise<void> = async () => {}) =>
+    ({
+      session: {
+        create: async () => ({ id: "sess_child_" + Math.random().toString(36).slice(2) }),
+        prompt: async () => ({ type: "user" }),
+        wait,
+        context: async () => messages,
+      },
+    }) as any
+  const delegateArgs = { team_name: "Backend", agent_type: "Backend Architect", prompt: "list files", worktree: false }
+  const asst = (...parts: any[]) => ({ type: "assistant", content: parts })
+  const idle = (outcome: string) => ({ type: "idle", outcome })
+
+  const okRes = await createDelegateTool(
+    fakeCtx([
+      { type: "user", text: "list files" },
+      asst({ type: "reasoning", text: "thinking" }, { type: "text", text: "authorize.ts\nroles.ts" }),
+      idle("succeeded"),
+    ]),
+  ).execute(delegateArgs, { sessionID: parentSession })
+  assert.ok(okRes.content.startsWith("[Teammate Completed] Backend (backend-architect)"), "Success keeps the prefix")
+  assert.ok(okRes.content.includes("authorize.ts\nroles.ts"), "Reply text must be returned")
+  assert.ok(!okRes.content.includes("Task execution dispatched"), "No dispatch stub")
+
+  const emptyRes = await createDelegateTool(
+    fakeCtx([asst({ type: "tool", name: "shell" }), idle("succeeded")]),
+  ).execute(delegateArgs, { sessionID: parentSession })
+  assert.ok(emptyRes.content.startsWith("[Teammate Error]"), "A reply with no text must be an error")
+  assert.ok(emptyRes.content.includes("no reply captured"), "Error names the cause")
+
+  const failedRes = await createDelegateTool(
+    fakeCtx([asst({ type: "text", text: "partial" }), idle("failed")]),
+  ).execute(delegateArgs, { sessionID: parentSession })
+  assert.ok(failedRes.content.startsWith("[Teammate Error]"), "A failed child is an error even with partial text")
+
+  const waitRes = await createDelegateTool(
+    fakeCtx([asst({ type: "text", text: "late" }), idle("succeeded")], async () => {
+      throw new Error("wait unsupported")
+    }),
+  ).execute(delegateArgs, { sessionID: parentSession })
+  assert.ok(waitRes.content.startsWith("[Teammate Error]"), "A throwing wait must not become a fake success")
+  // The child must run on the caller's model, never on the global default.
+  let createArgs: any
+  const modelCtx = fakeCtx([
+    { type: "assistant", model: { id: "nvidia/free-model", providerID: "nvidia" }, content: [{ type: "text", text: "ok" }] },
+    idle("succeeded"),
+  ])
+  const baseCreate = modelCtx.session.create
+  modelCtx.session.create = async (a: any) => ((createArgs = a), baseCreate())
+  await createDelegateTool(modelCtx).execute(delegateArgs, { sessionID: parentSession })
+  assert.deepEqual(createArgs.model, { id: "nvidia/free-model", providerID: "nvidia" }, "Child inherits caller model")
+  console.log("✓ team_delegate reply capture verified")
 
   console.log("\n==================================================")
   console.log(" ✓ All Agent-Teams v2 tests passed successfully!")

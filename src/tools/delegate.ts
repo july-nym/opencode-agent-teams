@@ -28,6 +28,25 @@ function normalizeAgentId(raw: string): string {
     .replace(/^-|-$/g, "")
 }
 
+const WAIT_TIMEOUT_MS = 600_000
+
+/** Text of the final assistant message, or undefined when it holds no text part. */
+export function lastAssistantText(messages: ReadonlyArray<any> | undefined): string | undefined {
+  const last = [...(messages ?? [])].reverse().find((m) => m?.type === "assistant")
+  const text = (last?.content ?? [])
+    .filter((p: any) => p?.type === "text")
+    .map((p: any) => p.text)
+    .join("\n")
+    .trim()
+  return text || undefined
+}
+
+/** Model of the most recent assistant message, so a child can run on the caller's model. */
+export function lastAssistantModel(messages: ReadonlyArray<any> | undefined): { id: string; providerID: string } | undefined {
+  const last = [...(messages ?? [])].reverse().find((m) => m?.type === "assistant" && m?.model?.id && m?.model?.providerID)
+  return last ? { id: last.model.id, providerID: last.model.providerID } : undefined
+}
+
 export function createDelegateTool(ctx: Plugin.Context) {
   return {
     id: "team_delegate",
@@ -59,10 +78,19 @@ export function createDelegateTool(ctx: Plugin.Context) {
       // Create child session via OpenCode v2 session API
       let childSession: any
       try {
+        // A specialist has no model of its own and would fall back to the global default,
+        // which can be a paid model. Run it on the model its caller already uses.
+        let model: { id: string; providerID: string } | undefined
+        try {
+          model = lastAssistantModel(await (ctx.session as any).context({ sessionID: toolCtx.sessionID }))
+        } catch {
+          model = undefined
+        }
         childSession = await ctx.session.create({
           agent: targetAgentId,
           parentID: toolCtx.sessionID,
           location: { directory: workDir },
+          ...(model ? { model } : {}),
         } as any)
       } catch (err: any) {
         if (sandbox) {
@@ -90,23 +118,37 @@ export function createDelegateTool(ctx: Plugin.Context) {
 
       try {
         // Dispatch task text to subagent (OpenCode v2 SessionPromptInput takes 'text')
-        const promptResult = await ctx.session.prompt({
+        await ctx.session.prompt({
           sessionID: sessionId,
           text: input.prompt,
         } as any)
 
-        if ((ctx.session as any)?.wait) {
-          try {
-            await (ctx.session as any).wait({ sessionID: sessionId })
-          } catch {
-            // Non-fatal if wait is unsupported or timed out
-          }
+        // prompt only queues the message. wait blocks until the child goes idle,
+        // and the reply is then read from the session context (verified on OpenCode 2.3.0).
+        let timer: ReturnType<typeof setTimeout> | undefined
+        try {
+          await Promise.race([
+            (ctx.session as any).wait({ sessionID: sessionId }),
+            new Promise((_, reject) => {
+              timer = setTimeout(
+                () => reject(new Error(`teammate did not finish within ${WAIT_TIMEOUT_MS / 1000}s`)),
+                WAIT_TIMEOUT_MS,
+              )
+            }),
+          ])
+        } finally {
+          clearTimeout(timer)
         }
 
-        let deliverableText =
-          (promptResult as any)?.text ||
-          (promptResult as any)?.content ||
-          "Task execution dispatched."
+        const messages = await (ctx.session as any).context({ sessionID: sessionId })
+        const idle = [...(messages ?? [])].reverse().find((m: any) => m?.type === "idle")
+        if (idle && idle.outcome !== "succeeded") {
+          throw new Error(`teammate session ended with outcome "${idle.outcome}"`)
+        }
+        const deliverableText = lastAssistantText(messages)
+        if (!deliverableText) {
+          throw new Error("no reply captured from the teammate session")
+        }
 
         // If a worktree was used, reconcile and merge changes back to base branch
         let reconcileNotice = ""
